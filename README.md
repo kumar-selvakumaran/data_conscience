@@ -1,6 +1,6 @@
-# Data Seance - Ethics Compliance Analysis System
+# TEST CHANGE Data Seance - Ethics Compliance Analysis System
 
-## Overview
+## Overview 
 
 **Data Seance** is an integrated ethics compliance analysis system for data science and AI projects. It combines explainable AI (XAI) methods, LLM-based ethics evaluation, and an interactive IDE-like interface to help teams identify and remediate ethical risks in datasets and machine learning models.
 
