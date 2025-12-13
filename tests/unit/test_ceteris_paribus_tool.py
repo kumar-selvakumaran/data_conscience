@@ -13,9 +13,10 @@ import numpy as np
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 
-from src.tools.xai import CeterisParibusTool
+from src.tools.xai import CeterisParibusTool, pipeline_maker
 from sklearn.preprocessing import OneHotEncoder
-
+from sklearn.pipeline import Pipeline
+from pydantic import ValidationError
 
 @pytest.fixture
 def sample_data():
@@ -31,36 +32,14 @@ def sample_data():
         'string_feature': [f'text_{i}' for i in range(n_samples)],
         'target': np.random.randn(n_samples)
     })
-        
-    # === Identify categorical columns ===
-    categorical_cols = data.select_dtypes(include=['object', 'category']).columns.tolist()
-    numerical_cols = data.select_dtypes(exclude=['object', 'category']).columns.tolist()
-
-    # === One-hot encode categorical features ===
-    if categorical_cols:
-        # Initialize OneHotEncoder
-        ohe = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
-        
-        # Fit on training data and transform both train and test
-        data_cat_encoded = ohe.fit_transform(data[categorical_cols])
-        
-        # Create DataFrames with encoded features
-        cat_feature_names = ohe.get_feature_names_out(categorical_cols)
-        data_cat_df = pd.DataFrame(data_cat_encoded, columns=cat_feature_names, index=data.index)
-        
-        # Combine numerical and encoded categorical features
-        data = pd.concat([data[numerical_cols].reset_index(drop=True), 
-                                data_cat_df.reset_index(drop=True)], axis=1)
-        
     return data
 
 
 @pytest.fixture
 def trained_model(sample_data):
-    """Train a model on all features (numeric + encoded non-numeric)"""
-    from sklearn.preprocessing import LabelEncoder
-    
-    # Prepare all features for model training
+    """Train a model_pipe on all features (numeric + encoded non-numeric)"""
+
+    # Prepare all features for model_pipe training
     X = sample_data.drop(columns=['target'])    
     y = sample_data['target']
     
@@ -68,24 +47,28 @@ def trained_model(sample_data):
         X, y, test_size=0.2, random_state=42
     )
     
-    model = RandomForestRegressor(n_estimators=10, random_state=42)
-    model.fit(X_train, y_train)
+    model_pipe = pipeline_maker(
+        RandomForestRegressor(n_estimators=10, random_state=42)
+    )
+    model_pipe.fit(X_train, y_train)
     
-    # Return model and test indices to match with full dataset
-    return model, X_test.index
+    # Return model_pipe and test indices to match with full dataset
+    return model_pipe, X_test.index
 
 
 @pytest.fixture
-def tool(trained_model, sample_data):
+def tool(
+    trained_model: Pipeline,
+    sample_data: pd.Dataframe):
     """Create a CeterisParibusTool instance with full dataset (including non-numeric features)"""
-    model, test_indices = trained_model
+    model_pipe, test_indices = trained_model
     
     # Tool receives full dataset with all original features (mixed types)
     # The tool will filter to only explain numeric features - what it doesn't need is ignored
     X_test_full = sample_data.loc[test_indices, :].drop(columns=['target'])
     
     return CeterisParibusTool(
-        model=model,
+        model_pipe=model_pipe,
         data=X_test_full,  # Full dataset - tool uses what it needs, ignores the rest
         max_num_datapoints=10
     )
@@ -94,13 +77,13 @@ def tool(trained_model, sample_data):
 @pytest.fixture
 def tool_large_max(trained_model, sample_data):
     """Create a CeterisParibusTool instance with large max_num_datapoints and full dataset"""
-    model, test_indices = trained_model
+    model_pipe, test_indices = trained_model
     
     # Tool receives full dataset with all original features (mixed types)
     X_test_full = sample_data.loc[test_indices, :].drop(columns=['target'])
     
     return CeterisParibusTool(
-        model=model,
+        model_pipe=model_pipe,
         data=X_test_full,  # Full dataset - tool uses what it needs, ignores the rest
         max_num_datapoints=100  # Much larger than X_test size
     )
@@ -110,8 +93,8 @@ class TestCeterisParibusToolInitialization:
     """Test tool initialization and explainable features detection"""
     
     def test_tool_initialization(self, tool):
-        """Test that tool can be initialized with model, data, and max_datapoints"""
-        assert tool.model is not None
+        """Test that tool can be initialized with model_pipe, data, and max_datapoints"""
+        assert tool.model_pipe is not None
         assert tool.data is not None
         assert tool.max_num_datapoints == 10
     
@@ -183,13 +166,10 @@ class TestCeterisParibusToolRun:
     
     def test_run_with_invalid_feature_name(self, tool):
         """Test running tool with a feature that doesn't exist"""
-        result = tool._run("nonexistent_feature", num_datapoints=3)
+        with pytest.raises(ValueError):
+            tool._run("nonexistent_feature", num_datapoints=3)
         
-        # Should return an error message
-        assert isinstance(result, str)
-        assert "ERROR" in result
-        assert "not found" in result.lower()
-    
+
     def test_run_with_non_numeric_feature(self, tool, sample_data):
         """Test running tool with a non-numeric feature"""
         # Check if we have non-numeric features in the original sample_data
@@ -200,14 +180,9 @@ class TestCeterisParibusToolRun:
         
         # Use a non-numeric feature name (even if not in tool.data, it should be rejected)
         feature_name = non_numeric_cols[0]
-        result = tool._run(feature_name, num_datapoints=3)
+        with pytest.raises(ValueError):
+            tool._run(feature_name, num_datapoints=3)
         
-        # Should return an error message
-        assert isinstance(result, str)
-        assert "ERROR" in result
-        # Either "not found" (if not in tool.data) or "cannot be explained" (if in tool.data but not numeric)
-        assert "not found" in result.lower() or "cannot be explained" in result.lower() or "numeric" in result.lower()
-    
     def test_run_caps_num_datapoints(self, tool):
         """Test that num_datapoints is capped at max_num_datapoints"""
         explainable = tool._explainable_features
@@ -338,12 +313,8 @@ class TestCeterisParibusToolAsync:
     @pytest.mark.asyncio
     async def test_arun_with_invalid_feature(self, tool):
         """Test async run with invalid feature"""
-        result = await tool._arun("nonexistent_feature", num_datapoints=3)
-        
-        # Should return error message
-        assert isinstance(result, str)
-        assert "ERROR" in result
-
+        with pytest.raises(ValueError):
+            await tool._arun("nonexistent_feature", num_datapoints=3)
 
 class TestCeterisParibusToolIntegration:
     """Integration tests with real data patterns from notebook"""
@@ -370,17 +341,17 @@ class TestCeterisParibusToolIntegration:
             'LSTAT': np.random.rand(n_samples) * 40,
         })
         
-        # Train a simple model
+        # Train a simple model_pipe
         X_train, X_test, y_train, y_test = train_test_split(
             data, np.random.randn(len(data)), test_size=0.3, random_state=42
         )
         
-        model = RandomForestRegressor(n_estimators=10, random_state=42)
-        model.fit(X_train, y_train)
+        model_pipe = pipeline_maker(RandomForestRegressor(n_estimators=10, random_state=42))
+        model_pipe.fit(X_train, y_train)
         
         # Create tool
         tool = CeterisParibusTool(
-            model=model,
+            model_pipe=model_pipe,
             data=X_test,
             max_num_datapoints=5
         )
@@ -406,23 +377,17 @@ class TestCeterisParibusToolIntegration:
         # if not explainable:
         #     pytest.skip("No explainable features in test data")
         
-        # Create a mock model that will raise an error
+        # Create a mock model_pipe that will raise an error
         class BadModel:
             def predict(self, X):
-                raise ValueError("Model error")
+                raise ValueError("model_pipe error")
         
-        bad_tool = CeterisParibusTool(
-            model=BadModel(),
-            data=tool.data,
-            max_num_datapoints=5
-        )
-        
-        result = bad_tool._run(explainable[0], num_datapoints=3)
-        
-        # Should return error message, not raise exception
-        assert isinstance(result, str)
-        assert "Error" in result
-
+        with pytest.raises(ValidationError):
+            CeterisParibusTool(
+                model_pipe=BadModel(),
+                data=tool.data,
+                max_num_datapoints=5
+            )
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

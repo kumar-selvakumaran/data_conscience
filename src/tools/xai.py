@@ -9,7 +9,61 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from io import BytesIO
+from sklearn.pipeline import Pipeline
 
+from sklearn.compose import ColumnTransformer, make_column_selector as selector
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+
+def pipeline_maker(
+    model_pipe,
+    *,
+    numeric_impute_strategy: str = "median",
+    categorical_impute_strategy: str = "most_frequent",
+    scale_numeric: bool = False,
+    one_hot: bool = True,
+    handle_unknown: str = "ignore",
+    sparse_output: bool = False,
+    remainder: str = "drop",
+) -> Pipeline:
+    """
+    Build an sklearn Pipeline for arbitrary tabular data:
+      - numeric cols: impute (+ optional scaling)
+      - categorical cols: impute + optional OneHotEncode
+      - then fits the provided `model_pipe`
+
+    Works for both regressors and classifiers (anything sklearn-like with fit/predict).
+    Assumes X is a pandas DataFrame (so dtype selectors work).
+    """
+
+    # Numeric preprocessing
+    num_steps = [("imputer", SimpleImputer(strategy=numeric_impute_strategy))]
+    if scale_numeric:
+        num_steps.append(("scaler", StandardScaler()))
+    numeric_pipe = Pipeline(steps=num_steps)
+
+    # Categorical preprocessing
+    cat_steps = [("imputer", SimpleImputer(strategy=categorical_impute_strategy))]
+    if one_hot:
+        cat_steps.append(
+            ("onehot", OneHotEncoder(handle_unknown=handle_unknown, sparse_output=sparse_output))
+        )
+    categorical_pipe = Pipeline(steps=cat_steps)
+
+    preprocess = ColumnTransformer(
+        transformers=[
+            ("num", numeric_pipe, selector(dtype_include=np.number)),
+            ("cat", categorical_pipe, selector(dtype_exclude=np.number)),
+        ],
+        remainder=remainder,
+        verbose_feature_names_out=False,
+    )
+
+    return Pipeline(steps=[
+        ("preprocess", preprocess),
+        ("model_pipe", model_pipe),
+    ])
 
 
 class CeterisParibusTool(BaseTool):
@@ -27,11 +81,11 @@ class CeterisParibusTool(BaseTool):
         "Returns a dictionary with feature names as keys and tuples of (PNG image bytes, DataFrame) as values."
     )
 
-    model: Any = Field(..., description="The fitted model")
+    model_pipe: Pipeline = Field(..., description="The model_pipe pipeline containing pre and post processing")
     data: pd.DataFrame = Field(..., description="The dataset")
     max_num_datapoints: int = Field(..., description="Maximum number of datapoints allowed")
     grid_points: int = Field(50, description="Grid resolution per feature")
-    
+
     @cached_property
     def _explainable_features(self) -> List[str]:
         """
@@ -70,10 +124,10 @@ class CeterisParibusTool(BaseTool):
         num_datapoints = max(1, min(num_datapoints, len(self.data)))
         X_targets = self.data.iloc[:num_datapoints].copy()
         # Binary probability if available
-        proba_fn = getattr(self.model, "predict_proba", None)
+        proba_fn = getattr(self.model_pipe, "predict_proba", None)
         is_binary = False
         if proba_fn is not None:
-            classes_ = getattr(self.model, "classes_", None)
+            classes_ = getattr(self.model_pipe, "classes_", None)
             is_binary = classes_ is not None and len(classes_) == 2
 
         if feature_name not in self._explainable_features:
@@ -86,9 +140,9 @@ class CeterisParibusTool(BaseTool):
         base_df[feature_name] = np.tile(grid, num_datapoints)
 
         if proba_fn is not None and is_binary:
-            preds = self.model.predict_proba(base_df)[:, 1]
+            preds = self.model_pipe.predict_proba(base_df)[:, 1]
         else:
-            preds = self.model.predict(base_df)
+            preds = self.model_pipe.predict(base_df)
         
         row_ids = np.repeat(np.arange(num_datapoints), self.grid_points)
         df_plot = pd.DataFrame(
@@ -132,11 +186,13 @@ class CeterisParibusTool(BaseTool):
         # Validate feature name is explainable
         if feature_name not in self._explainable_features:
             if feature_name not in self.data.columns:
-                return f"ERROR: Feature '{feature_name}' not found in dataset. Available features: {list(self.data.columns)}"
+                raise ValueError(f"ERROR: Feature '{feature_name}' not found in dataset. Available features: {list(self.data.columns)}")
             else:
-                return (
-                    f"ERROR: Feature '{feature_name}' cannot be explained using ICE plots. "
-                    f"Only numeric features are supported. Explainable features: {self._explainable_features}"
+                raise ValueError(
+                    str(
+                        f"ERROR: Feature '{feature_name}' cannot be explained using ICE plots. "
+                        f"Only numeric features are supported. Explainable features: {self._explainable_features}"
+                    )
                 )
         
         # Cap num_datapoints at the maximum allowed
@@ -152,7 +208,7 @@ class CeterisParibusTool(BaseTool):
             return result
             
         except Exception as e:
-            return f"Error generating Ceteris Paribus plots: {e}"
+            raise RuntimeError(f"Error generating Ceteris Paribus plots: {e}")
     
     async def _arun(self, feature_name: str, num_datapoints: int) -> Dict[str, Tuple[bytes, pd.DataFrame]]:
         """Async version - simple shim"""

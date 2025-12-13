@@ -4,3 +4,4 @@ src/playground
 uv.lock
 .venv
 *.env*
+*pytest_pycache*
